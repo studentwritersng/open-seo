@@ -22,6 +22,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
+      - name: Verify trusted repository and ref
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "studentwritersng/open-seo"
+          test "$GITHUB_REF" = "refs/heads/main"
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -40,7 +46,7 @@ jobs:
 
       - name: Write self-host environment
         env:
-          ENV_SELFHOST: ${{ secrets.ENV_SELFHOST }}
+          ENV_SELFHOST: ${{ secrets.SELFHOST_ENV }}
         run: |
           set -euo pipefail
           umask 077
@@ -54,15 +60,18 @@ jobs:
           trap cleanup_on_failure EXIT
           git check-ignore -q .env.selfhost
           git check-ignore -q .env.selfhost.tmp
+          test ! -e .env.selfhost
+          test ! -L .env.selfhost
+          test ! -e .env.selfhost.tmp
+          test ! -L .env.selfhost.tmp
           test -n "$ENV_SELFHOST"
-          printf '%s\n' "$ENV_SELFHOST" > .env.selfhost
-          tr -d '\r' < .env.selfhost > .env.selfhost.tmp
+          printf '%s\n' "$ENV_SELFHOST" | tr -d '\r' > .env.selfhost.tmp
           mv .env.selfhost.tmp .env.selfhost
 
       - name: Validate deployment environment
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SELFHOST_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SELFHOST_CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
           test -n "$CLOUDFLARE_API_TOKEN"
@@ -75,12 +84,22 @@ jobs:
               exit 1
             fi
           }
+          reject_duplicate_assignment() {
+            key=$1
+            count=$(grep -Ec "^[[:space:]]*${key}[[:space:]]*=" .env.selfhost || true)
+            if [ "$count" -gt 1 ]; then
+              echo "::error::$key must not be assigned more than once in .env.selfhost"
+              exit 1
+            fi
+          }
           require_unique_assignment DATAFORSEO_API_KEY
           require_unique_assignment ACCESS_ALLOWED_EMAILS
           require_unique_assignment WORKERS_SUBDOMAIN
           require_unique_assignment AUTH_MODE
           require_unique_assignment DATABASE_PROVIDER
           require_unique_assignment OPENSEO_TELEMETRY_DISABLED
+          reject_duplicate_assignment TEAM_DOMAIN
+          reject_duplicate_assignment POLICY_AUD
           grep -q '^DATAFORSEO_API_KEY=.' .env.selfhost
           grep -q '^ACCESS_ALLOWED_EMAILS=.' .env.selfhost
           grep -q '^AUTH_MODE=cloudflare_access$' .env.selfhost
@@ -96,14 +115,14 @@ jobs:
       - name: Bootstrap Alchemy state
         if: ${{ inputs.bootstrap_state }}
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SELFHOST_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SELFHOST_CLOUDFLARE_ACCOUNT_ID }}
         run: pnpm alchemy cloudflare bootstrap
 
       - name: Deploy OpenSEO
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SELFHOST_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SELFHOST_CLOUDFLARE_ACCOUNT_ID }}
         run: pnpm deploy:selfhost --yes
 
       - name: Verify Cloudflare Access
@@ -114,7 +133,11 @@ jobs:
             code="${response%% *}"
             location="${response#* }"
             case "$location" in
-              https://*.cloudflareaccess.com/cdn-cgi/access/login*) exit 0 ;;
+              https://*.cloudflareaccess.com/cdn-cgi/access/login*)
+                if [ -n "$code" ] && [ "$code" -ge 300 ] && [ "$code" -lt 400 ]; then
+                  exit 0
+                fi
+                ;;
             esac
             if [ -n "$code" ] && [ "$code" -ge 200 ] && [ "$code" -lt 500 ] && [ "$code" != 404 ]; then
               echo "::error::$DEPLOY_URL responded without a Cloudflare Access challenge"
@@ -127,3 +150,7 @@ jobs:
 
       - name: Publish deployment URL
         run: printf '### Deployed\n%s\n' "$DEPLOY_URL" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove self-host environment files
+        if: always()
+        run: rm -f .env.selfhost .env.selfhost.tmp
