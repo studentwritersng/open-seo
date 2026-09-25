@@ -1,0 +1,194 @@
+name: Self-host Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      bootstrap_state:
+        description: Bootstrap Alchemy state before deploying
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: selfhost-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment: selfhost
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Verify trusted repository and ref
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "studentwritersng/open-seo"
+          test "$GITHUB_REF" = "refs/heads/main"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+
+      - name: Enable pnpm
+        run: corepack enable
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Write self-host environment
+        env:
+          ENV_SELFHOST: ${{ secrets.SELFHOST_ENV }}
+        run: |
+          set -euo pipefail
+          umask 077
+          cleanup_on_failure() {
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              rm -f -- .env.selfhost .env.selfhost.*.tmp
+            fi
+            exit "$status"
+          }
+          trap cleanup_on_failure EXIT
+          test ! -e .env.selfhost
+          test ! -L .env.selfhost
+          /usr/bin/git check-ignore -q .env.selfhost
+          /usr/bin/git check-ignore -q .env.selfhost.placeholder.tmp
+          test -n "$ENV_SELFHOST"
+          node <<'NODE'
+          const crypto = require("node:crypto");
+          const { execFileSync } = require("node:child_process");
+          const fs = require("node:fs");
+
+          const target = ".env.selfhost";
+          let tempPath;
+          let fd;
+
+          try {
+            const suffix = crypto.randomBytes(16).toString("hex");
+            tempPath = `.env.selfhost.${suffix}.tmp`;
+
+            execFileSync("/usr/bin/git", ["check-ignore", "-q", tempPath], { stdio: "ignore" });
+
+            fd = fs.openSync(
+              tempPath,
+              fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+              0o600,
+            );
+            const contents = `${process.env.ENV_SELFHOST.replace(/\r/g, "")}\n`;
+            fs.writeFileSync(fd, contents, { encoding: "utf8" });
+            fs.fsyncSync(fd);
+            fs.closeSync(fd);
+            fd = undefined;
+            fs.linkSync(tempPath, target);
+            fs.unlinkSync(tempPath);
+            tempPath = undefined;
+          } catch (error) {
+            if (fd !== undefined) {
+              try {
+                fs.closeSync(fd);
+              } catch {}
+            }
+            if (tempPath !== undefined) {
+              try {
+                fs.unlinkSync(tempPath);
+              } catch {}
+            }
+            throw error;
+          }
+          NODE
+
+      - name: Validate deployment environment
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SELFHOST_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SELFHOST_CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          require_unique_assignment() {
+            key=$1
+            count=$(grep -Ec "^[[:space:]]*${key}[[:space:]]*=" .env.selfhost || true)
+            if [ "$count" -ne 1 ]; then
+              echo "::error::$key must be assigned exactly once in .env.selfhost"
+              exit 1
+            fi
+          }
+          reject_duplicate_assignment() {
+            key=$1
+            count=$(grep -Ec "^[[:space:]]*${key}[[:space:]]*=" .env.selfhost || true)
+            if [ "$count" -gt 1 ]; then
+              echo "::error::$key must not be assigned more than once in .env.selfhost"
+              exit 1
+            fi
+          }
+          require_unique_assignment DATAFORSEO_API_KEY
+          require_unique_assignment ACCESS_ALLOWED_EMAILS
+          require_unique_assignment WORKERS_SUBDOMAIN
+          require_unique_assignment AUTH_MODE
+          require_unique_assignment DATABASE_PROVIDER
+          require_unique_assignment OPENSEO_TELEMETRY_DISABLED
+          reject_duplicate_assignment TEAM_DOMAIN
+          reject_duplicate_assignment POLICY_AUD
+          grep -q '^DATAFORSEO_API_KEY=.' .env.selfhost
+          grep -q '^ACCESS_ALLOWED_EMAILS=.' .env.selfhost
+          grep -q '^AUTH_MODE=cloudflare_access$' .env.selfhost
+          grep -q '^DATABASE_PROVIDER=d1$' .env.selfhost
+          grep -q '^OPENSEO_TELEMETRY_DISABLED=1$' .env.selfhost
+          subdomain=$(sed -n 's/^WORKERS_SUBDOMAIN=//p' .env.selfhost | tr -d '\r' | tail -n 1)
+          case "$subdomain" in
+            *.workers.dev) ;;
+            *) echo "::error::ENV_SELFHOST must contain a valid WORKERS_SUBDOMAIN"; exit 1 ;;
+          esac
+          echo "DEPLOY_URL=https://open-seo-selfhost.$subdomain" >> "$GITHUB_ENV"
+
+      - name: Bootstrap Alchemy state
+        if: ${{ inputs.bootstrap_state }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SELFHOST_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SELFHOST_CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm alchemy cloudflare bootstrap
+
+      - name: Deploy OpenSEO
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SELFHOST_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SELFHOST_CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm deploy:selfhost --yes
+
+      - name: Verify Cloudflare Access
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5 6 7 8; do
+            response=$(curl -sS -o /dev/null -m 10 -w '%{http_code} %{redirect_url}' "$DEPLOY_URL") || response=""
+            code="${response%% *}"
+            location="${response#* }"
+            case "$location" in
+              https://*.cloudflareaccess.com/cdn-cgi/access/login*)
+                if [ -n "$code" ] && [ "$code" -ge 300 ] && [ "$code" -lt 400 ]; then
+                  exit 0
+                fi
+                ;;
+            esac
+            if [ -n "$code" ] && [ "$code" -ge 200 ] && [ "$code" -lt 500 ] && [ "$code" != 404 ]; then
+              echo "::error::$DEPLOY_URL responded without a Cloudflare Access challenge"
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "::error::Could not verify Cloudflare Access protection for $DEPLOY_URL"
+          exit 1
+
+      - name: Publish deployment URL
+        run: printf '### Deployed\n%s\n' "$DEPLOY_URL" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove self-host environment files
+        if: always()
+        run: rm -f -- .env.selfhost .env.selfhost.*.tmp
