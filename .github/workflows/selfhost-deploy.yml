@@ -44,11 +44,20 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          cleanup_on_failure() {
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              rm -f .env.selfhost .env.selfhost.tmp
+            fi
+            exit "$status"
+          }
+          trap cleanup_on_failure EXIT
+          git check-ignore -q .env.selfhost
+          git check-ignore -q .env.selfhost.tmp
           test -n "$ENV_SELFHOST"
           printf '%s\n' "$ENV_SELFHOST" > .env.selfhost
           tr -d '\r' < .env.selfhost > .env.selfhost.tmp
           mv .env.selfhost.tmp .env.selfhost
-          git check-ignore -q .env.selfhost
 
       - name: Validate deployment environment
         env:
@@ -58,6 +67,20 @@ jobs:
           set -euo pipefail
           test -n "$CLOUDFLARE_API_TOKEN"
           test -n "$CLOUDFLARE_ACCOUNT_ID"
+          require_unique_assignment() {
+            key=$1
+            count=$(grep -Ec "^[[:space:]]*${key}[[:space:]]*=" .env.selfhost || true)
+            if [ "$count" -ne 1 ]; then
+              echo "::error::$key must be assigned exactly once in .env.selfhost"
+              exit 1
+            fi
+          }
+          require_unique_assignment DATAFORSEO_API_KEY
+          require_unique_assignment ACCESS_ALLOWED_EMAILS
+          require_unique_assignment WORKERS_SUBDOMAIN
+          require_unique_assignment AUTH_MODE
+          require_unique_assignment DATABASE_PROVIDER
+          require_unique_assignment OPENSEO_TELEMETRY_DISABLED
           grep -q '^DATAFORSEO_API_KEY=.' .env.selfhost
           grep -q '^ACCESS_ALLOWED_EMAILS=.' .env.selfhost
           grep -q '^AUTH_MODE=cloudflare_access$' .env.selfhost
