@@ -80,7 +80,7 @@ jobs:
 
             fd = fs.openSync(
               tempPath,
-              fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+              fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
               0o600,
             );
             const contents = `${process.env.ENV_SELFHOST.replace(/\r/g, "")}\n`;
