@@ -53,20 +53,58 @@ jobs:
           cleanup_on_failure() {
             status=$?
             if [ "$status" -ne 0 ]; then
-              rm -f .env.selfhost .env.selfhost.tmp
+              rm -f -- .env.selfhost .env.selfhost.*.tmp
             fi
             exit "$status"
           }
           trap cleanup_on_failure EXIT
-          git check-ignore -q .env.selfhost
-          git check-ignore -q .env.selfhost.tmp
           test ! -e .env.selfhost
           test ! -L .env.selfhost
-          test ! -e .env.selfhost.tmp
-          test ! -L .env.selfhost.tmp
+          /usr/bin/git check-ignore -q .env.selfhost
+          /usr/bin/git check-ignore -q .env.selfhost.placeholder.tmp
           test -n "$ENV_SELFHOST"
-          printf '%s\n' "$ENV_SELFHOST" | tr -d '\r' > .env.selfhost.tmp
-          mv .env.selfhost.tmp .env.selfhost
+          node <<'NODE'
+          const crypto = require("node:crypto");
+          const { execFileSync } = require("node:child_process");
+          const fs = require("node:fs");
+
+          const target = ".env.selfhost";
+          let tempPath;
+          let fd;
+
+          try {
+            const suffix = crypto.randomBytes(16).toString("hex");
+            tempPath = `.env.selfhost.${suffix}.tmp`;
+
+            execFileSync("/usr/bin/git", ["check-ignore", "-q", tempPath], { stdio: "ignore" });
+
+            fd = fs.openSync(
+              tempPath,
+              fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+              0o600,
+            );
+            const contents = `${process.env.ENV_SELFHOST.replace(/\r/g, "")}\n`;
+            fs.writeFileSync(fd, contents, { encoding: "utf8" });
+            fs.fsyncSync(fd);
+            fs.closeSync(fd);
+            fd = undefined;
+            fs.linkSync(tempPath, target);
+            fs.unlinkSync(tempPath);
+            tempPath = undefined;
+          } catch (error) {
+            if (fd !== undefined) {
+              try {
+                fs.closeSync(fd);
+              } catch {}
+            }
+            if (tempPath !== undefined) {
+              try {
+                fs.unlinkSync(tempPath);
+              } catch {}
+            }
+            throw error;
+          }
+          NODE
 
       - name: Validate deployment environment
         env:
@@ -153,4 +191,4 @@ jobs:
 
       - name: Remove self-host environment files
         if: always()
-        run: rm -f .env.selfhost .env.selfhost.tmp
+        run: rm -f -- .env.selfhost .env.selfhost.*.tmp
